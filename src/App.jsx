@@ -198,7 +198,26 @@ export default function App() {
     try { await navigator.clipboard.writeText(url); setCopied(true); setTimeout(() => setCopied(false), 2000) } catch {}
   }
 
-  const handleLogin = () => { window.location.href = '/api/auth/login' }
+  const [loginLoading, setLoginLoading] = useState(false)
+
+  const handleLogin = () => {
+    const clientId = import.meta.env.VITE_GITHUB_CLIENT_ID
+    if (!clientId) {
+      // Fallback: hit backend endpoint which reads env server-side
+      window.location.href = '/api/auth/login'
+      return
+    }
+    setLoginLoading(true)
+    const state  = Math.random().toString(36).slice(2)
+    sessionStorage.setItem('oauth_state', state)
+    const params = new URLSearchParams({
+      client_id:    clientId,
+      redirect_uri: window.location.origin + '/api/auth/callback',
+      scope:        'repo user',
+      state,
+    })
+    window.location.href = `https://github.com/login/oauth/authorize?${params}`
+  }
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { credentials: 'include', redirect: 'manual' })
@@ -292,8 +311,9 @@ export default function App() {
               </div>
             ) : (
               /* Not logged in */
-              <button className="btn btn-github btn-sm" onClick={handleLogin}>
-                {IcGithub} Login with GitHub
+              <button className="btn btn-github btn-sm" onClick={handleLogin} disabled={loginLoading}>
+                {loginLoading ? <Spinner size={14} color="#fff" /> : IcGithub}
+                {loginLoading ? 'Redirecting…' : 'Login with GitHub'}
               </button>
             )}
           </div>
@@ -318,8 +338,11 @@ export default function App() {
                 Login with your GitHub account and upload any ZIP directly into your own repositories.
               </p>
 
-              <button className="btn btn-github btn-lg" onClick={handleLogin} style={{ margin: '0 auto', display: 'inline-flex' }}>
-                {IcGithub} Continue with GitHub
+              <button className="btn btn-github btn-lg" onClick={handleLogin}
+                disabled={loginLoading}
+                style={{ margin: '0 auto', display: 'inline-flex', minWidth: 260, justifyContent: 'center' }}>
+                {loginLoading ? <Spinner size={18} color="#fff" /> : IcGithub}
+                <span>{loginLoading ? 'Redirecting to GitHub…' : 'Continue with GitHub'}</span>
               </button>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginTop: 40 }}>

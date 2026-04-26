@@ -5,7 +5,13 @@ const https = require('https');
 // GET /api/auth/callback?code=xxx
 // Exchanges OAuth code for access_token, stores in HttpOnly cookie
 module.exports = async function handler(req, res) {
-  const { code } = req.query;
+  const { code, error: oauthError } = req.query;
+
+  // Handle user denying OAuth
+  if (oauthError) {
+    console.log('OAuth denied by user:', oauthError);
+    return res.redirect('/?error=' + encodeURIComponent(oauthError));
+  }
 
   if (!code) {
     return res.redirect('/?error=missing_code');
