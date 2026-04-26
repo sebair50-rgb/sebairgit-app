@@ -4,37 +4,40 @@
   "framework": "vite",
   "regions": ["cdg1"],
   "functions": {
-    "api/upload.js": {
-      "maxDuration": 60,
-      "memory": 1024
-    }
+    "api/upload.js":          { "maxDuration": 60, "memory": 1024 },
+    "api/auth/login.js":      { "maxDuration": 10 },
+    "api/auth/callback.js":   { "maxDuration": 10 },
+    "api/auth/logout.js":     { "maxDuration": 5  },
+    "api/auth/me.js":         { "maxDuration": 5  }
   },
   "headers": [
     {
       "source": "/api/(.*)",
       "headers": [
-        { "key": "Access-Control-Allow-Origin", "value": "*" },
-        { "key": "Access-Control-Allow-Methods", "value": "POST, OPTIONS" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+        { "key": "Access-Control-Allow-Origin",      "value": "https://sebairgit-app.vercel.app" },
+        { "key": "Access-Control-Allow-Methods",     "value": "GET, POST, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers",     "value": "Content-Type" },
+        { "key": "Access-Control-Allow-Credentials", "value": "true" }
       ]
     },
     {
       "source": "/sw.js",
       "headers": [
-        { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" },
-        { "key": "Service-Worker-Allowed", "value": "/" }
+        { "key": "Cache-Control",        "value": "no-cache, no-store, must-revalidate" },
+        { "key": "Service-Worker-Allowed","value": "/" }
       ]
     },
     {
       "source": "/(.*)",
       "headers": [
         { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "X-Frame-Options", "value": "DENY" },
-        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+        { "key": "X-Frame-Options",        "value": "DENY" },
+        { "key": "Referrer-Policy",        "value": "strict-origin-when-cross-origin" }
       ]
     }
   ],
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" }
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/((?!api|assets|sw\\.js|workbox|manifest|icon|favicon).*)", "destination": "/index.html" }
   ]
 }
