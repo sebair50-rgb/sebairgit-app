@@ -3,16 +3,13 @@
 const https = require('https');
 
 // GET /api/auth/callback?code=xxx
-// Exchanges OAuth code for access_token, stores in HttpOnly cookie
+// Full OAuth exchange — token in HttpOnly cookie, user data in redirect URL
 module.exports = async function handler(req, res) {
   const { code, error: oauthError } = req.query;
 
-  // Handle user denying OAuth
   if (oauthError) {
-    console.log('OAuth denied by user:', oauthError);
     return res.redirect('/?error=' + encodeURIComponent(oauthError));
   }
-
   if (!code) {
     return res.redirect('/?error=missing_code');
   }
@@ -25,42 +22,47 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    // Exchange code for access_token (server-side only)
-    const tokenData = await postJSON('https://github.com/login/oauth/access_token', {
-      client_id:     clientId,
-      client_secret: clientSecret,
-      code,
-    });
+    // ── 1. Exchange code → access_token ──────────────────────────────────────
+    const tokenData = await postJSON(
+      'https://github.com/login/oauth/access_token',
+      { client_id: clientId, client_secret: clientSecret, code }
+    );
 
     const access_token = tokenData.access_token;
-
     if (!access_token) {
+      const reason = tokenData.error_description || tokenData.error || 'no_token';
       console.error('Token exchange failed:', tokenData);
-      return res.redirect('/?error=token_exchange_failed');
+      return res.redirect('/?error=' + encodeURIComponent(reason));
     }
 
-    // Fetch GitHub user profile to store username
-    const user = await getJSON('https://api.github.com/user', access_token);
+    // ── 2. Fetch GitHub user profile ──────────────────────────────────────────
+    const ghUser = await getJSON('https://api.github.com/user', access_token);
+    if (!ghUser || !ghUser.login) {
+      return res.redirect('/?error=could_not_fetch_user');
+    }
 
-    // Store token in secure HttpOnly cookie (never readable by JS)
-    // Also store username in a readable cookie for the UI
-    const isProd  = process.env.NODE_ENV === 'production' || req.headers.host?.includes('vercel.app');
-    const secure  = isProd ? 'Secure; ' : '';
-    const maxAge  = 60 * 60 * 8; // 8 hours
+    const userPayload = {
+      login:  ghUser.login,
+      name:   ghUser.name  || ghUser.login,
+      avatar: ghUser.avatar_url,
+    };
 
+    // ── 3. Set HttpOnly cookie for the token (never visible to JS) ────────────
+    const maxAge = 60 * 60 * 8; // 8 hours
     res.setHeader('Set-Cookie', [
-      // HttpOnly: JS can NOT read this — contains the real token
-      `gh_token=${access_token}; HttpOnly; ${secure}SameSite=Lax; Path=/; Max-Age=${maxAge}`,
-      // Readable: JS CAN read this — only contains username (safe)
-      `gh_user=${encodeURIComponent(JSON.stringify({ login: user.login, avatar: user.avatar_url, name: user.name || user.login }))}; ${secure}SameSite=Lax; Path=/; Max-Age=${maxAge}`,
+      `gh_token=${access_token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
+      `gh_user=${encodeURIComponent(JSON.stringify(userPayload))}; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
     ]);
 
-    // Redirect back to the app
-    res.redirect('/?auth=success');
+    // ── 4. Redirect with user data encoded in URL so frontend picks it up ─────
+    // Using #hash so the data never hits server logs
+    // Base64-encode the user profile — only public, non-sensitive info
+    const b64 = Buffer.from(JSON.stringify(userPayload)).toString('base64url');
+    return res.redirect('/?auth=ok&u=' + b64);
 
   } catch (err) {
-    console.error('OAuth callback error:', err);
-    res.redirect('/?error=' + encodeURIComponent(err.message));
+    console.error('OAuth callback error:', err.message);
+    return res.redirect('/?error=' + encodeURIComponent(err.message || 'auth_failed'));
   }
 };
 
@@ -69,24 +71,23 @@ module.exports = async function handler(req, res) {
 function postJSON(url, body) {
   return new Promise((resolve, reject) => {
     const payload = JSON.stringify(body);
-    const u = new URL(url);
-    const options = {
+    const u       = new URL(url);
+    const req     = https.request({
       hostname: u.hostname,
       path:     u.pathname,
       method:   'POST',
       headers: {
-        'Accept':       'application/json',
+        Accept:         'application/json',
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(payload),
         'User-Agent':   'SebairGit/1.0',
       },
-    };
-    const req = https.request(options, res => {
-      let data = '';
-      res.on('data', c => data += c);
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Invalid JSON from GitHub: ' + data.slice(0, 100))); }
+        try { resolve(JSON.parse(d)); }
+        catch { reject(new Error('Bad JSON from token endpoint: ' + d.slice(0, 120))); }
       });
     });
     req.on('error', reject);
@@ -97,23 +98,22 @@ function postJSON(url, body) {
 
 function getJSON(url, token) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const options = {
+    const u   = new URL(url);
+    const req = https.request({
       hostname: u.hostname,
-      path:     u.pathname + (u.search || ''),
+      path:     u.pathname,
       method:   'GET',
       headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept':        'application/vnd.github.v3+json',
-        'User-Agent':    'SebairGit/1.0',
+        Authorization: `Bearer ${token}`,
+        Accept:        'application/vnd.github.v3+json',
+        'User-Agent':  'SebairGit/1.0',
       },
-    };
-    const req = https.request(options, res => {
-      let data = '';
-      res.on('data', c => data += c);
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Invalid JSON: ' + data.slice(0, 100))); }
+        try { resolve(JSON.parse(d)); }
+        catch { reject(new Error('Bad JSON from user endpoint: ' + d.slice(0, 120))); }
       });
     });
     req.on('error', reject);

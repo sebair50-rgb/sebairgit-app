@@ -1,29 +1,39 @@
 'use strict';
 
 // GET /api/auth/me
-// Returns current authenticated user from cookie (no token exposed)
+// Returns current user from HttpOnly cookie — used for page-refresh verification
 module.exports = function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
 
   const cookies = parseCookies(req.headers.cookie || '');
-  const rawUser = cookies['gh_user'];
-  const hasToken = !!cookies['gh_token']; // just check existence, never send it
+  const hasToken = !!cookies['gh_token'];
+  const rawUser  = cookies['gh_user'];
 
-  if (!hasToken || !rawUser) {
+  if (!hasToken) {
     return res.status(200).json({ authenticated: false });
   }
 
-  try {
-    const user = JSON.parse(decodeURIComponent(rawUser));
-    res.status(200).json({ authenticated: true, user });
-  } catch {
-    res.status(200).json({ authenticated: false });
+  if (rawUser) {
+    try {
+      const user = JSON.parse(decodeURIComponent(rawUser));
+      return res.status(200).json({ authenticated: true, user });
+    } catch {}
   }
+
+  // Token exists but user cookie missing — still authenticated
+  return res.status(200).json({ authenticated: true, user: null });
 };
 
 function parseCookies(header) {
-  return Object.fromEntries(
-    header.split(';').map(c => c.trim().split('=').map(p => p.trim()))
-      .filter(p => p.length === 2)
-  );
+  const result = {};
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const key = part.slice(0, idx).trim();
+      const val = part.slice(idx + 1).trim();
+      result[key] = val;
+    }
+  }
+  return result;
 }

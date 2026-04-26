@@ -149,18 +149,61 @@ export default function App() {
   const fileInputRef = useRef()
   const logsRef      = useRef()
 
-  // ── Check auth state on load ────────────────────────────────────────────────
+  // ── Check auth state on load ─────────────────────────────────────────────────
   useEffect(() => {
-    // Handle OAuth redirect result
     const params = new URLSearchParams(window.location.search)
-    if (params.get('auth') === 'success' || params.get('error')) {
-      window.history.replaceState({}, '', '/')
+    const authOk  = params.get('auth') === 'ok'
+    const userB64 = params.get('u')
+    const authErr = params.get('error')
+
+    // ── Path A: fresh OAuth redirect — user data is right in the URL ──────────
+    if (authOk && userB64) {
+      try {
+        const decoded = JSON.parse(atob(userB64))
+        if (decoded.login) {
+          setUser(decoded)
+          localStorage.setItem('sg_user', JSON.stringify(decoded))
+          window.history.replaceState({}, '', '/')
+          setAuthLoading(false)
+          return
+        }
+      } catch {}
     }
 
-    fetch('/api/auth/me', { credentials: 'include' })
-      .then(r => r.json())
+    // ── Path B: OAuth returned an error ───────────────────────────────────────
+    if (authErr) {
+      console.warn('OAuth error:', authErr)
+      // Show error briefly then clear
+      setError('GitHub login failed: ' + decodeURIComponent(authErr))
+      setPhase('error')
+      window.history.replaceState({}, '', '/')
+      setAuthLoading(false)
+      return
+    }
+
+    // ── Path C: Page refresh — try localStorage cache first (instant) ─────────
+    const cached = localStorage.getItem('sg_user')
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached)
+        if (parsed.login) {
+          setUser(parsed) // show UI immediately
+        }
+      } catch {}
+    }
+
+    // ── Path D: Verify session with server (background) ───────────────────────
+    fetch('/api/auth/me', { credentials: 'include', cache: 'no-store' })
+      .then(r => r.ok ? r.json() : { authenticated: false })
       .then(data => {
-        if (data.authenticated) setUser(data.user)
+        if (data.authenticated && data.user?.login) {
+          setUser(data.user)
+          localStorage.setItem('sg_user', JSON.stringify(data.user))
+        } else if (!data.authenticated) {
+          // Server says not authed — clear stale cache
+          setUser(null)
+          localStorage.removeItem('sg_user')
+        }
       })
       .catch(() => {})
       .finally(() => setAuthLoading(false))
@@ -220,8 +263,10 @@ export default function App() {
   }
 
   const handleLogout = async () => {
-    await fetch('/api/auth/logout', { credentials: 'include', redirect: 'manual' })
-    setUser(null); reset()
+    try { await fetch('/api/auth/logout', { credentials: 'include', redirect: 'manual' }) } catch {}
+    localStorage.removeItem('sg_user')
+    setUser(null)
+    reset()
     window.location.href = '/'
   }
 
