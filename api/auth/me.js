@@ -1,39 +1,39 @@
 'use strict';
-
-// GET /api/auth/me
-// Returns current user from HttpOnly cookie — used for page-refresh verification
+/**
+ * GET /api/auth/me
+ * Returns current authenticated user — used on page refresh.
+ * Token stays in HttpOnly cookie, only public user data returned.
+ */
 module.exports = function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
 
-  const cookies = parseCookies(req.headers.cookie || '');
-  const hasToken = !!cookies['gh_token'];
+  const cookies  = parseCookies(req.headers.cookie || '');
+  const hasToken = Boolean(cookies['gh_token']);
   const rawUser  = cookies['gh_user'];
 
   if (!hasToken) {
-    return res.status(200).json({ authenticated: false });
+    return res.end(JSON.stringify({ authenticated: false }));
   }
 
   if (rawUser) {
     try {
       const user = JSON.parse(decodeURIComponent(rawUser));
-      return res.status(200).json({ authenticated: true, user });
-    } catch {}
+      if (user && user.login) {
+        return res.end(JSON.stringify({ authenticated: true, user }));
+      }
+    } catch { /* fall through */ }
   }
 
-  // Token exists but user cookie missing — still authenticated
-  return res.status(200).json({ authenticated: true, user: null });
+  res.end(JSON.stringify({ authenticated: true, user: null }));
 };
 
 function parseCookies(header) {
-  const result = {};
-  for (const part of header.split(';')) {
-    const idx = part.indexOf('=');
-    if (idx > 0) {
-      const key = part.slice(0, idx).trim();
-      const val = part.slice(idx + 1).trim();
-      result[key] = val;
-    }
+  const map = {};
+  for (const chunk of header.split(';')) {
+    const idx = chunk.indexOf('=');
+    if (idx < 1) continue;
+    map[chunk.slice(0, idx).trim()] = chunk.slice(idx + 1).trim();
   }
-  return result;
+  return map;
 }
