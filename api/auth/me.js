@@ -1,39 +1,42 @@
-'use strict';
 /**
  * GET /api/auth/me
- * Returns current authenticated user — used on page refresh.
- * Token stays in HttpOnly cookie, only public user data returned.
+ * Validates JWT from Authorization: Bearer <token> header.
+ * Returns public user info — NO cookies read or set.
  */
+'use strict';
+
+const { verifyToken } = require('../_jwt');
+
 module.exports = function handler(req, res) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Cache-Control', 'no-store');
 
-  const cookies  = parseCookies(req.headers.cookie || '');
-  const hasToken = Boolean(cookies['gh_token']);
-  const rawUser  = cookies['gh_user'];
-
-  if (!hasToken) {
-    return res.end(JSON.stringify({ authenticated: false }));
+  if (req.method === 'OPTIONS') {
+    setCORS(res);
+    return res.status(200).end();
   }
 
-  if (rawUser) {
-    try {
-      const user = JSON.parse(decodeURIComponent(rawUser));
-      if (user && user.login) {
-        return res.end(JSON.stringify({ authenticated: true, user }));
-      }
-    } catch { /* fall through */ }
-  }
+  setCORS(res);
 
-  res.end(JSON.stringify({ authenticated: true, user: null }));
+  try {
+    const decoded = verifyToken(req.headers.authorization);
+    res.end(JSON.stringify({
+      authenticated: true,
+      user: {
+        login:  decoded.login,
+        name:   decoded.name,
+        avatar: decoded.avatar,
+        // ghToken is intentionally NOT returned
+      },
+    }));
+  } catch (err) {
+    res.statusCode = err.status || 401;
+    res.end(JSON.stringify({ authenticated: false, error: err.message }));
+  }
 };
 
-function parseCookies(header) {
-  const map = {};
-  for (const chunk of header.split(';')) {
-    const idx = chunk.indexOf('=');
-    if (idx < 1) continue;
-    map[chunk.slice(0, idx).trim()] = chunk.slice(idx + 1).trim();
-  }
-  return map;
+function setCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin',  'https://sebairgit-app.vercel.app');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
 }
