@@ -4,27 +4,25 @@
   "framework": "vite",
   "regions": ["cdg1"],
   "functions": {
-    "api/upload.js":          { "maxDuration": 60, "memory": 1024 },
-    "api/auth/login.js":      { "maxDuration": 10 },
-    "api/auth/callback.js":   { "maxDuration": 10 },
-    "api/auth/logout.js":     { "maxDuration": 5  },
-    "api/auth/me.js":         { "maxDuration": 5  }
+    "api/upload.js":        { "maxDuration": 60, "memory": 1024 },
+    "api/auth/login.js":    { "maxDuration": 10 },
+    "api/auth/callback.js": { "maxDuration": 15 },
+    "api/auth/me.js":       { "maxDuration": 5  }
   },
   "headers": [
     {
       "source": "/api/(.*)",
       "headers": [
-        { "key": "Access-Control-Allow-Origin",      "value": "https://sebairgit-app.vercel.app" },
-        { "key": "Access-Control-Allow-Methods",     "value": "GET, POST, OPTIONS" },
-        { "key": "Access-Control-Allow-Headers",     "value": "Content-Type" },
-        { "key": "Access-Control-Allow-Credentials", "value": "true" }
+        { "key": "Access-Control-Allow-Origin",  "value": "https://sebairgit-app.vercel.app" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Authorization, Content-Type" }
       ]
     },
     {
       "source": "/sw.js",
       "headers": [
-        { "key": "Cache-Control",        "value": "no-cache, no-store, must-revalidate" },
-        { "key": "Service-Worker-Allowed","value": "/" }
+        { "key": "Cache-Control",         "value": "no-cache, no-store, must-revalidate" },
+        { "key": "Service-Worker-Allowed", "value": "/" }
       ]
     },
     {
