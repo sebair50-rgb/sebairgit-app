@@ -338,10 +338,10 @@ export default function App() {
       })
 
       for (const [delay, step, msg] of [
-        [900,  2, '→ Creating GitHub repository…'],
-        [1800, 3, '→ Uploading files via Tree API…'],
-        [3200, 4, '→ Creating commit…'],
-        [400,  5, '→ Verifying file count…'],
+        [1000, 2, '→ Creating GitHub repository…'],
+        [2500, 3, '→ Uploading files via Tree API…'],
+        [2000, 4, '→ Creating commit…'],
+        [500,  5, '→ Verifying file count…'],
       ]) {
         await new Promise(r => setTimeout(r, delay))
         setStepIdx(step); addLog(msg, 'info')
@@ -618,7 +618,7 @@ export default function App() {
                 {[
                   ['Repository', result.owner + '/' + result.repoName],
                   ['Branch',     result.branch],
-                  ['Files',      result.fileCount + '/' + result.expectedCount + (result.verified ? ' ✓' : ' ⚠')],
+                  ['Files',      result.fileCount + '/' + result.expectedCount + (result.verified ? ' ✓' : ' ⚠') + (result.skipped ? ` (${result.skipped} skipped)` : '')],
                   ['Commit',     result.commitSha],
                   ['Size',       result.totalSizeKb + ' KB'],
                 ].map(([k, v]) => (
