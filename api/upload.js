@@ -10,7 +10,7 @@ const fs              = require('fs');
 const crypto          = require('crypto');
 const { Octokit }     = require('@octokit/rest');
 const AdmZip          = require('adm-zip');
-const formidable      = require('formidable');
+const { formidable }  = require('formidable');
 const { verifyToken } = require('./_jwt');
 
 // ── Config ────────────────────────────────────────────────────────────────────
