@@ -185,6 +185,7 @@ module.exports = async function handler(req, res) {
     return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
   }
 
+  const _reqStart = Date.now();
   let tmpPath = null;
 
   try {
@@ -315,6 +316,21 @@ module.exports = async function handler(req, res) {
     const uploadedCount  = verifyTree.tree.filter(i => i.type === 'blob' && i.path !== 'README.md').length;
     const expectedCount  = extractedFiles.length;
     const verified       = uploadedCount >= expectedCount;
+
+    // ── Save upload record to Supabase ──────────────────────────────────
+    const userId = decoded.userId;
+    if (userId) {
+      db.saveUpload({
+        userId, login: decoded.login,
+        fileName: originalName, fileSize: uploaded.size || 0,
+        repoUrl: repo.html_url, repoName,
+        owner, fileCount: uploadedCount,
+        expectedCount, verified,
+        commitSha: newCommit.sha.slice(0, 7),
+        elapsedMs: Date.now() - _reqStart,
+        status: 'success',
+      }).catch(e => console.error('[upload] Failed to save history:', e.message));
+    }
 
     return res.status(200).json({
       success:       true,
