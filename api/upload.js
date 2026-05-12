@@ -1,372 +1,282 @@
+'use strict';
 /**
  * POST /api/upload
- * JWT auth via Authorization: Bearer header — zero cookies.
- * Robust ZIP extraction + GitHub Tree API with retry logic.
+ * Production ZIP → GitHub upload
+ * - JWT auth (HS256, server-verified)
+ * - Plan-based limits from Supabase plan_limits table
+ * - ZIP preview validation before upload starts
+ * - GitHub Tree API with exponential backoff retry
+ * - Full audit log to Supabase uploads table
  */
-'use strict';
+const path         = require('path');
+const fs           = require('fs');
+const crypto       = require('crypto');
+const { Octokit }  = require('@octokit/rest');
+const AdmZip       = require('adm-zip');
+const formidable   = require('formidable');
+const { setCORS, verifyJWT, db } = require('./_lib');
 
-const path            = require('path');
-const fs              = require('fs');
-const crypto          = require('crypto');
-const { Octokit }     = require('@octokit/rest');
-const AdmZip          = require('adm-zip');
-const { formidable }  = require('formidable');
-const { verifyToken } = require('./_jwt');
+const BATCH_SIZE    = 5;
+const MAX_RETRIES   = 3;
+const SKIP_PATTERNS = ['__MACOSX', '.DS_Store', 'Thumbs.db', 'desktop.ini', '.git/', 'node_modules/'];
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const MAX_ZIP_SIZE   = 50 * 1024 * 1024;   // 50 MB
-const MAX_BLOB_BYTES = 99 * 1024 * 1024;   // 99 MB GitHub blob limit
-const BATCH_SIZE     = 5;                   // concurrent blob creates (conservative)
-const RATE_LIMIT     = 10;
-const RATE_WINDOW_MS = 60_000;
-
-// Entries to skip from ZIP
-const SKIP_PATTERNS = [
-  '__MACOSX', '.DS_Store', 'Thumbs.db', 'desktop.ini',
-  '.git/', '.git\\', 'node_modules/',
-];
-
-// ── Rate limiter ──────────────────────────────────────────────────────────────
-const _rl = new Map();
-function rateLimit(ip) {
-  const now = Date.now();
-  let e = _rl.get(ip);
-  if (!e || now > e.reset) e = { count: 0, reset: now + RATE_WINDOW_MS };
-  e.count++;
-  _rl.set(ip, e);
-  return e.count <= RATE_LIMIT;
+// ── Exponential backoff retry ─────────────────────────────────────────────
+async function withRetry(fn, retries = MAX_RETRIES, label = '') {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const wait = 500 * Math.pow(2, attempt - 1);
+      console.warn(`[retry] ${label} attempt ${attempt}/${retries}: ${err.message} (${wait}ms)`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
 }
 
-// ── ZIP extraction ─────────────────────────────────────────────────────────────
-function extractZip(zipPath) {
+// ── ZIP extraction ────────────────────────────────────────────────────────
+function extractZip(zipPath, limits) {
   let zip;
-  try {
-    zip = new AdmZip(zipPath);
-  } catch (err) {
-    throw new Error(`Invalid or corrupted ZIP file: ${err.message}`);
-  }
+  try { zip = new AdmZip(zipPath); }
+  catch (e) { throw new Error('Invalid or corrupted ZIP file.'); }
 
-  const files  = [];
-  const errors = [];
+  const files = [], skipped = [];
 
   for (const entry of zip.getEntries()) {
-    // Skip directories
     if (entry.isDirectory) continue;
-
-    // Normalize path separators
     let filePath = entry.entryName.replace(/\\/g, '/');
+    const norm   = path.posix.normalize(filePath);
 
-    // Skip system/hidden files
-    if (SKIP_PATTERNS.some(p => filePath.includes(p))) continue;
-    if (filePath.split('/').some(part => part.startsWith('.'))) continue;
+    if (norm.startsWith('../') || norm.includes('/../')) { skipped.push('traversal: ' + filePath); continue; }
+    if (SKIP_PATTERNS.some(p => filePath.includes(p)))   { skipped.push('system: '    + filePath); continue; }
+    if (filePath.split('/').some(p => p.startsWith('.'))) { skipped.push('hidden: '    + filePath); continue; }
 
-    // Prevent path traversal
-    const normalized = path.posix.normalize(filePath);
-    if (normalized.startsWith('../') || normalized.includes('/../')) {
-      errors.push(`Skipped (path traversal): ${filePath}`);
-      continue;
-    }
-    filePath = normalized;
-
-    // Skip empty file names
-    if (!filePath || filePath === '.') continue;
-
-    // Read file content as Buffer (handles binary + text)
     let content;
-    try {
-      content = entry.getData();
-    } catch (err) {
-      errors.push(`Skipped (unreadable): ${filePath} — ${err.message}`);
+    try { content = entry.getData(); }
+    catch { skipped.push('unreadable: ' + filePath); continue; }
+    if (!content?.length) continue;
+
+    if (content.length > limits.max_file_bytes) {
+      skipped.push(`too large (${(content.length/1048576).toFixed(1)}MB): ${filePath}`);
       continue;
     }
 
-    if (!content || content.length === 0) continue;
-
-    // Skip files exceeding GitHub's blob limit
-    if (content.length > MAX_BLOB_BYTES) {
-      errors.push(`Skipped (too large for GitHub: ${(content.length/1048576).toFixed(1)}MB): ${filePath}`);
-      continue;
-    }
-
-    files.push({ path: filePath, content, size: content.length });
+    files.push({ path: norm, content, size: content.length });
   }
-
-  return { files, errors };
+  return { files, skipped };
 }
 
-// ── Strip single common root directory ────────────────────────────────────────
-// e.g. "myproject/src/a.js" → "src/a.js" when all files share "myproject/" root
 function stripRoot(files) {
-  if (files.length === 0) return files;
-
+  if (!files.length) return files;
   const roots = [...new Set(files.map(f => f.path.split('/')[0]))];
-  if (roots.length !== 1) return files;  // multiple roots → keep as-is
-
+  if (roots.length !== 1) return files;
   const prefix   = roots[0] + '/';
   const stripped = files
-    .map(f => ({
-      ...f,
-      path: f.path.startsWith(prefix) ? f.path.slice(prefix.length) : f.path,
-    }))
+    .map(f => ({ ...f, path: f.path.startsWith(prefix) ? f.path.slice(prefix.length) : f.path }))
     .filter(f => f.path.length > 0);
-
   return stripped.length === files.length ? stripped : files;
 }
 
-// ── Create a single GitHub blob with retry ────────────────────────────────────
-async function createBlobWithRetry(octokit, owner, repo, file, retries = 3) {
-  let lastError;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const { data } = await octokit.git.createBlob({
-        owner,
-        repo,
-        content:  file.content.toString('base64'),
-        encoding: 'base64',
-      });
-      return { path: file.path, sha: data.sha };
-    } catch (err) {
-      lastError = err;
-      if (attempt < retries) {
-        // Exponential backoff: 500ms, 1000ms, 2000ms
-        await new Promise(r => setTimeout(r, 500 * attempt));
-      }
-    }
-  }
-  throw new Error(`Blob failed after ${retries} attempts [${file.path}]: ${lastError?.message}`);
-}
-
-// ── Create blobs in batches ────────────────────────────────────────────────────
-async function createAllBlobs(octokit, owner, repo, files) {
-  const blobs  = [];
-  const failed = [];
-
+// ── Blob creation with retry ───────────────────────────────────────────────
+async function createBlobs(octokit, owner, repo, files) {
+  const results = [], failed = [];
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch   = files.slice(i, i + BATCH_SIZE);
-    const results = await Promise.allSettled(
-      batch.map(f => createBlobWithRetry(octokit, owner, repo, f))
+    const settled = await Promise.allSettled(
+      batch.map(f =>
+        withRetry(
+          () => octokit.git.createBlob({ owner, repo, content: f.content.toString('base64'), encoding: 'base64' })
+              .then(r => ({ path: f.path, sha: r.data.sha })),
+          MAX_RETRIES,
+          `blob:${f.path}`
+        )
+      )
     );
-
-    for (let j = 0; j < results.length; j++) {
-      if (results[j].status === 'fulfilled') {
-        blobs.push(results[j].value);
-      } else {
-        failed.push({ path: batch[j].path, error: results[j].reason?.message });
-        console.error(`[upload] Blob failed: ${batch[j].path} — ${results[j].reason?.message}`);
-      }
-    }
+    settled.forEach((r, j) => {
+      if (r.status === 'fulfilled') results.push(r.value);
+      else { console.error(`[blob] ${batch[j].path}: ${r.reason?.message}`); failed.push(batch[j].path); }
+    });
   }
-
-  return { blobs, failed };
+  return { results, failed };
 }
 
-// ── Main handler ───────────────────────────────────────────────────────────────
+// ── Main handler ──────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  setCORS(res);
+  setCORS(res, 'POST, OPTIONS');
+  res.setHeader('Content-Type', 'application/json');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST')   return res.status(405).json({ error: 'Method not allowed' });
 
-  // ── 1. Validate JWT ───────────────────────────────────────────────────────
+  // 1. Authenticate
   let decoded;
-  try {
-    decoded = verifyToken(req.headers.authorization);
-  } catch (err) {
-    return res.status(err.status || 401).json({ error: err.message });
-  }
+  try { decoded = verifyJWT(req.headers.authorization); }
+  catch (e) { return res.status(e.status || 401).json({ error: e.message }); }
 
-  const GH_TOKEN = decoded.ghToken;
-  if (!GH_TOKEN) {
-    return res.status(401).json({ error: 'Token missing GitHub credentials. Please login again.' });
-  }
+  const userId  = decoded.sub;
+  const ghToken = decoded.ghToken;
+  if (!ghToken) return res.status(401).json({ error: 'Token missing GitHub credentials. Please login again.' });
 
-  // ── 2. Rate limit ─────────────────────────────────────────────────────────
-  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || 'anon';
-  if (!rateLimit(ip)) {
-    return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
-  }
+  // 2. Plan limits
+  const [user, limits] = await Promise.all([
+    db.getUser(userId),
+    db.getPlanLimits(decoded.plan || 'free'),
+  ]).catch(e => { throw Object.assign(new Error('Database error: ' + e.message), { status: 500 }); });
 
-  const _reqStart = Date.now();
-  let tmpPath = null;
+  if (!user) return res.status(401).json({ error: 'User not found. Please login again.' });
 
-  try {
-    // ── 3. Parse multipart upload ───────────────────────────────────────────
-    const form = formidable({
-      maxFileSize:    MAX_ZIP_SIZE,
-      uploadDir:      '/tmp',
-      keepExtensions: true,
-      filename:       () => `sg-${crypto.randomBytes(8).toString('hex')}.zip`,
+  const todayCount = await db.todayUploadCount(userId);
+  if (todayCount >= limits.max_uploads_day) {
+    return res.status(429).json({
+      error: `Daily upload limit reached (${limits.max_uploads_day}/day on ${user.plan} plan).`,
+      plan: user.plan,
     });
+  }
 
+  // 3. Parse multipart
+  const form = formidable({
+    maxFileSize:    limits.max_file_bytes,
+    uploadDir:      '/tmp',
+    keepExtensions: true,
+    filename:       () => `sg-${crypto.randomBytes(8).toString('hex')}.zip`,
+  });
+
+  let tmpPath = null, uploadId = null;
+
+  try {
     const [, files] = await new Promise((resolve, reject) =>
-      form.parse(req, (err, fields, files) =>
-        err ? reject(err) : resolve([fields, files])
-      )
+      form.parse(req, (err, fields, files) => err ? reject(err) : resolve([fields, files]))
     );
 
     const uploaded = (files.zip || files.file || [])[0];
-    if (!uploaded) {
-      return res.status(400).json({ error: 'No file received. Use field name "zip".' });
-    }
+    if (!uploaded) return res.status(400).json({ error: 'No file received. Use field name "zip".' });
 
     tmpPath = uploaded.filepath;
     const originalName = uploaded.originalFilename || 'upload.zip';
+    const fileSize     = uploaded.size || 0;
 
-    // ── 4. Validate ZIP magic bytes (PK header) ─────────────────────────────
+    // 4. Validate ZIP magic bytes
     const magic = Buffer.alloc(4);
     const fd    = fs.openSync(tmpPath, 'r');
     fs.readSync(fd, magic, 0, 4, 0);
     fs.closeSync(fd);
-    if (magic[0] !== 0x50 || magic[1] !== 0x4b) {
+    if (magic[0] !== 0x50 || magic[1] !== 0x4b)
       return res.status(400).json({ error: 'File is not a valid ZIP archive.' });
-    }
 
-    // ── 5. Extract ZIP ──────────────────────────────────────────────────────
-    const { files: rawFiles, errors: extractErrors } = extractZip(tmpPath);
-
-    if (rawFiles.length === 0) {
-      return res.status(400).json({
-        error: 'ZIP contains no uploadable files.',
-        details: extractErrors,
-      });
-    }
-
+    // 5. Extract
+    const { files: rawFiles, skipped } = extractZip(tmpPath, limits);
     const extractedFiles = stripRoot(rawFiles);
-    const totalBytes     = extractedFiles.reduce((s, f) => s + f.size, 0);
 
-    console.log(`[upload] Extracted ${extractedFiles.length} files, ${(totalBytes/1048576).toFixed(2)} MB`);
-    if (extractErrors.length) {
-      console.log(`[upload] Skipped ${extractErrors.length} entries:`, extractErrors);
-    }
+    if (!extractedFiles.length)
+      return res.status(400).json({ error: 'ZIP contains no uploadable files.', skipped });
 
-    // ── 6. Create GitHub repo ───────────────────────────────────────────────
-    const octokit = new Octokit({ auth: GH_TOKEN });
+    if (extractedFiles.length > limits.max_files)
+      return res.status(400).json({
+        error: `ZIP has ${extractedFiles.length} files. Limit is ${limits.max_files} on ${user.plan} plan.`,
+        plan: user.plan,
+      });
 
+    const totalBytes = extractedFiles.reduce((s, f) => s + f.size, 0);
+    const startMs    = Date.now();
+
+    // 6. Create pending DB record
+    const record = await db.saveUpload({
+      user_id: userId, original_name: originalName,
+      file_size_bytes: fileSize, file_count: extractedFiles.length, status: 'pending',
+    });
+    uploadId = record?.id;
+
+    // 7. GitHub setup
+    const octokit = new Octokit({ auth: ghToken });
     const { data: ghUser } = await octokit.users.getAuthenticated();
     const owner = ghUser.login;
 
     const base = originalName
-      .replace(/\.zip$/i, '')
-      .replace(/[^a-zA-Z0-9._-]/g, '-')
-      .replace(/-{2,}/g, '-')
-      .replace(/^-|-$/g, '')
-      .toLowerCase()
-      .slice(0, 80);
+      .replace(/\.zip$/i, '').replace(/[^a-zA-Z0-9._-]/g, '-')
+      .replace(/-{2,}/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 80);
     const repoName = `${base || 'upload'}-${crypto.randomBytes(3).toString('hex')}`;
 
-    const { data: repo } = await octokit.repos.createForAuthenticatedUser({
-      name:        repoName,
-      description: `Uploaded via SebairGit · ${new Date().toISOString().split('T')[0]} · ${extractedFiles.length} files`,
-      private:     false,
-      auto_init:   true,
-    });
+    console.log(`[upload] ${owner}/${repoName}: ${extractedFiles.length} files, ${(totalBytes/1048576).toFixed(2)}MB`);
 
-    // Wait for GitHub to finish initialising the repo
+    // 8. Create repo
+    const { data: repo } = await withRetry(
+      () => octokit.repos.createForAuthenticatedUser({
+        name: repoName,
+        description: `Uploaded via SebairGit · ${new Date().toISOString().split('T')[0]} · ${extractedFiles.length} files`,
+        private: false, auto_init: true,
+      }), MAX_RETRIES, 'create_repo'
+    );
+
     await new Promise(r => setTimeout(r, 2500));
 
-    // ── 7. Get base tree SHA ────────────────────────────────────────────────
-    const { data: ref }    = await octokit.git.getRef({ owner, repo: repoName, ref: `heads/${repo.default_branch}` });
-    const { data: commit } = await octokit.git.getCommit({ owner, repo: repoName, commit_sha: ref.object.sha });
+    // 9. Get base commit
+    const { data: ref }        = await withRetry(() => octokit.git.getRef({ owner, repo: repoName, ref: `heads/${repo.default_branch}` }), MAX_RETRIES, 'get_ref');
+    const { data: baseCommit } = await withRetry(() => octokit.git.getCommit({ owner, repo: repoName, commit_sha: ref.object.sha }), MAX_RETRIES, 'get_commit');
 
-    // ── 8. Create all blobs (parallel batches with retry) ──────────────────
-    const { blobs, failed: failedBlobs } = await createAllBlobs(octokit, owner, repoName, extractedFiles);
+    // 10. Create blobs
+    console.log(`[upload] Creating ${extractedFiles.length} blobs...`);
+    const { results: blobs, failed: failedBlobs } = await createBlobs(octokit, owner, repoName, extractedFiles);
+    if (!blobs.length) throw new Error('All blob creations failed. GitHub API may be unavailable.');
 
-    if (blobs.length === 0) {
-      throw new Error(`All ${extractedFiles.length} file uploads failed. Check GitHub API limits.`);
+    // 11. Create tree
+    const { data: newTree } = await withRetry(
+      () => octokit.git.createTree({
+        owner, repo: repoName,
+        base_tree: baseCommit.tree.sha,
+        tree: blobs.map(({ path: p, sha }) => ({ path: p, mode: '100644', type: 'blob', sha })),
+      }), MAX_RETRIES, 'create_tree'
+    );
+
+    // 12. Commit
+    const { data: newCommit } = await withRetry(
+      () => octokit.git.createCommit({ owner, repo: repoName, message: `chore: upload ${blobs.length} files via SebairGit`, tree: newTree.sha, parents: [ref.object.sha] }),
+      MAX_RETRIES, 'create_commit'
+    );
+
+    await withRetry(
+      () => octokit.git.updateRef({ owner, repo: repoName, ref: `heads/${repo.default_branch}`, sha: newCommit.sha }),
+      MAX_RETRIES, 'update_ref'
+    );
+
+    // 13. Verify
+    const { data: verifyTree } = await octokit.git.getTree({ owner, repo: repoName, tree_sha: newCommit.sha, recursive: '1' });
+    const uploadedCount = verifyTree.tree.filter(i => i.type === 'blob' && i.path !== 'README.md').length;
+    const verified      = uploadedCount >= extractedFiles.length;
+    const durationMs    = Date.now() - startMs;
+
+    console.log(`[upload] Done: ${uploadedCount}/${extractedFiles.length} verified=${verified} (${durationMs}ms)`);
+
+    // 14. Update DB
+    if (uploadId) {
+      await db.updateUpload(uploadId, {
+        repo_name: repoName, repo_url: repo.html_url, repo_owner: owner,
+        branch: repo.default_branch, commit_sha: newCommit.sha.slice(0, 7),
+        file_count: uploadedCount, status: verified ? 'success' : 'error',
+        error_message: verified ? null : `Only ${uploadedCount}/${extractedFiles.length} files uploaded`,
+        duration_ms: durationMs,
+      });
     }
 
-    // ── 9. Create tree ──────────────────────────────────────────────────────
-    const { data: newTree } = await octokit.git.createTree({
-      owner,
-      repo: repoName,
-      base_tree: commit.tree.sha,
-      tree: blobs.map(({ path: p, sha }) => ({
-        path: p,
-        mode: '100644',
-        type: 'blob',
-        sha,
-      })),
-    });
-
-    // ── 10. Create commit ───────────────────────────────────────────────────
-    const { data: newCommit } = await octokit.git.createCommit({
-      owner,
-      repo:    repoName,
-      message: `chore: upload ${blobs.length} files via SebairGit`,
-      tree:    newTree.sha,
-      parents: [ref.object.sha],
-    });
-
-    // ── 11. Update branch ref ───────────────────────────────────────────────
-    await octokit.git.updateRef({
-      owner,
-      repo:  repoName,
-      ref:   `heads/${repo.default_branch}`,
-      sha:   newCommit.sha,
-      force: false,
-    });
-
-    // ── 12. Verify ──────────────────────────────────────────────────────────
-    const { data: verifyTree } = await octokit.git.getTree({
-      owner,
-      repo:     repoName,
-      tree_sha: newCommit.sha,
-      recursive: '1',
-    });
-
-    const uploadedCount  = verifyTree.tree.filter(i => i.type === 'blob' && i.path !== 'README.md').length;
-    const expectedCount  = extractedFiles.length;
-    const verified       = uploadedCount >= expectedCount;
-
-    // ── Save upload record to Supabase ──────────────────────────────────
-    const userId = decoded.userId;
-    if (userId) {
-      db.saveUpload({
-        userId, login: decoded.login,
-        fileName: originalName, fileSize: uploaded.size || 0,
-        repoUrl: repo.html_url, repoName,
-        owner, fileCount: uploadedCount,
-        expectedCount, verified,
-        commitSha: newCommit.sha.slice(0, 7),
-        elapsedMs: Date.now() - _reqStart,
-        status: 'success',
-      }).catch(e => console.error('[upload] Failed to save history:', e.message));
-    }
+    db.incrementStats(userId, uploadedCount, totalBytes).catch(e => console.error('[stats]', e.message));
 
     return res.status(200).json({
-      success:       true,
-      repoUrl:       repo.html_url,
-      repoName,
-      owner,
-      branch:        repo.default_branch,
-      fileCount:     uploadedCount,
-      expectedCount,
-      verified,
-      commitSha:     newCommit.sha.slice(0, 7),
-      totalSizeKb:   Math.round(totalBytes / 1024),
-      // Debug info
-      skipped:       extractErrors.length,
-      blobsFailed:   failedBlobs.length,
+      success: true, repoUrl: repo.html_url, repoName, owner,
+      branch: repo.default_branch, fileCount: uploadedCount,
+      expectedCount: extractedFiles.length, verified,
+      commitSha: newCommit.sha.slice(0, 7),
+      totalSizeKb: Math.round(totalBytes / 1024), durationMs,
+      skipped: skipped.length, failedBlobs: failedBlobs.length,
     });
 
   } catch (err) {
-    console.error('[upload] Fatal error:', err.message);
-
-    if (err.status === 401) return res.status(401).json({ error: 'GitHub token expired. Please login again.' });
-    if (err.status === 403) return res.status(403).json({ error: 'GitHub permission denied. Check token scopes.' });
-    if (err.status === 422) return res.status(422).json({ error: 'Repository name conflict. Try again.' });
-    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'ZIP too large. Max 50 MB.' });
-
+    console.error('[upload] Fatal:', err.message);
+    if (uploadId) db.updateUpload(uploadId, { status: 'error', error_message: err.message?.slice(0, 500) }).catch(() => {});
+    if (err.status === 401)     return res.status(401).json({ error: 'GitHub token expired. Please login again.' });
+    if (err.status === 403)     return res.status(403).json({ error: 'GitHub permission denied.' });
+    if (err.status === 422)     return res.status(422).json({ error: 'Repository name conflict. Try again.' });
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File too large for your plan.' });
     return res.status(500).json({ error: err.message || 'Upload failed.' });
 
   } finally {
-    if (tmpPath) {
-      try { fs.unlinkSync(tmpPath); } catch {}
-    }
+    if (tmpPath) try { fs.unlinkSync(tmpPath); } catch {}
   }
 };
-
-function setCORS(res) {
-  res.setHeader('Access-Control-Allow-Origin',  'https://sebairgit-app.vercel.app');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-}
